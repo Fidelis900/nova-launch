@@ -104,6 +104,18 @@ mod two_step_admin_test;
 mod two_step_admin_standalone_test;
 
 #[cfg(test)]
+mod supply_cap_test;
+
+#[cfg(test)]
+mod cross_contract_integration_test;
+
+#[cfg(test)]
+mod cross_contract_auth_test;
+
+#[cfg(test)]
+mod governance_quorum_test;
+
+#[cfg(test)]
 mod multisig_test;
 
 // #[cfg(test)]
@@ -393,6 +405,86 @@ impl TokenFactory {
         storage::clear_pending_admin(&env);
 
         events::emit_admin_transfer(&env, &old_admin, &new_admin);
+
+        Ok(())
+    }
+
+    /// Cancel a pending admin transfer (two-step transfer - cancel)
+    ///
+    /// Allows the current admin to cancel a pending admin proposal before it is accepted.
+    ///
+    /// # Errors
+    /// * `Unauthorized` - Caller is not the current admin
+    /// * `InvalidParameters` - No pending admin transfer exists
+    pub fn cancel_admin(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let stored_admin = storage::get_admin(&env);
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let pending = storage::get_pending_admin(&env).ok_or(Error::InvalidParameters)?;
+        storage::clear_pending_admin(&env);
+        events::emit_admin_cancelled(&env, &admin, &pending);
+
+        Ok(())
+    }
+
+    /// Register a trusted cross-contract caller (admin only)
+    ///
+    /// Marks `caller` as an authorized contract address that may invoke
+    /// privileged entry points via `assert_trusted_caller`.
+    ///
+    /// # Errors
+    /// * `Unauthorized` - Caller is not the admin
+    pub fn register_trusted_caller(env: Env, admin: Address, caller: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let stored_admin = storage::get_admin(&env);
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        storage::set_trusted_caller(&env, &caller);
+        events::emit_trusted_caller_added(&env, &admin, &caller);
+
+        Ok(())
+    }
+
+    /// Revoke a trusted cross-contract caller (admin only)
+    ///
+    /// # Errors
+    /// * `Unauthorized` - Caller is not the admin
+    pub fn revoke_trusted_caller(env: Env, admin: Address, caller: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let stored_admin = storage::get_admin(&env);
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        storage::remove_trusted_caller(&env, &caller);
+        events::emit_trusted_caller_removed(&env, &admin, &caller);
+
+        Ok(())
+    }
+
+    /// Assert that the caller is a registered trusted contract
+    ///
+    /// Call this at the top of any entry point that should only be reachable
+    /// from an authorized cross-contract caller. Emits an event on success.
+    ///
+    /// # Errors
+    /// * `Unauthorized` - `caller` is not in the trusted-caller registry
+    pub fn assert_trusted_caller(env: Env, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
+
+        if !storage::is_trusted_caller(&env, &caller) {
+            return Err(Error::Unauthorized);
+        }
+
+        events::emit_cross_contract_call(&env, &caller);
 
         Ok(())
     }
@@ -2198,6 +2290,41 @@ impl TokenFactory {
     /// ```
     pub fn get_remaining_mintable(env: Env, token_index: u32) -> Option<i128> {
         mint::get_remaining_mintable(&env, token_index)
+    }
+
+    /// Update the supply cap for a token (creator only)
+    ///
+    /// Sets or removes the max supply cap. The new cap must be >= current total supply.
+    ///
+    /// # Errors
+    /// * `Unauthorized` - Caller is not the token creator
+    /// * `TokenNotFound` - Token does not exist
+    /// * `InvalidMaxSupply` - New cap is below current total supply
+    pub fn set_supply_cap(
+        env: Env,
+        creator: Address,
+        token_index: u32,
+        new_cap: Option<i128>,
+    ) -> Result<(), Error> {
+        creator.require_auth();
+
+        let mut info = storage::get_token_info(&env, token_index).ok_or(Error::TokenNotFound)?;
+
+        if info.creator != creator {
+            return Err(Error::Unauthorized);
+        }
+
+        if let Some(cap) = new_cap {
+            if cap < info.total_supply {
+                return Err(Error::InvalidMaxSupply);
+            }
+        }
+
+        info.max_supply = new_cap;
+        storage::set_token_info(&env, token_index, &info);
+        storage::set_token_info_by_address(&env, &info.address, &info);
+
+        Ok(())
     }
 
     // ═══════════════════════════════════════════════════════════════════════
